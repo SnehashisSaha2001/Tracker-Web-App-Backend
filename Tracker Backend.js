@@ -4,20 +4,18 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const { Sequelize } = require('sequelize');
+const { Sequelize, DataTypes } = require('sequelize');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
 // -------------------------
-// Check required environment variables
+// Environment variable check
 const requiredEnv = ['DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT', 'JWT_SECRET'];
-requiredEnv.forEach((key) => {
-  if (!process.env[key]) {
-    console.warn(`⚠️  Warning: Environment variable ${key} is not set!`);
-  }
+requiredEnv.forEach(key => {
+  if (!process.env[key]) console.warn(`⚠️ Warning: ${key} is not set!`);
 });
 
-// Database Configuration
+// Database configuration
 const sequelize = new Sequelize(
   process.env.DB_NAME || 'trackerdb',
   process.env.DB_USER || 'postgres',
@@ -30,41 +28,45 @@ const sequelize = new Sequelize(
   }
 );
 
-// Models Definition
+// -------------------------
+// Models
 const Employee = sequelize.define('Employee', {
-  name: { type: Sequelize.STRING, allowNull: false },
-  employeeId: { type: Sequelize.STRING, unique: true, allowNull: false },
-  mobileNo: { type: Sequelize.STRING, allowNull: false },
-  email: { type: Sequelize.STRING, allowNull: false },
-  password: { type: Sequelize.STRING, allowNull: false },
-  role: { type: Sequelize.ENUM('employee', 'admin'), defaultValue: 'employee' },
+  name: { type: DataTypes.STRING, allowNull: false },
+  employeeId: { type: DataTypes.STRING, unique: true, allowNull: false },
+  mobileNo: { type: DataTypes.STRING, allowNull: false },
+  email: { type: DataTypes.STRING, allowNull: false },
+  password: { type: DataTypes.STRING, allowNull: false },
+  role: { type: DataTypes.ENUM('employee', 'admin'), defaultValue: 'employee' },
 }, { timestamps: true });
 
 const Activity = sequelize.define('Activity', {
-  employeeId: { type: Sequelize.INTEGER, references: { model: 'Employee', key: 'id' } },
-  type: { type: Sequelize.ENUM('check-in', 'check-out', 'visit'), allowNull: false },
-  details: { type: Sequelize.TEXT },
-  location: { type: Sequelize.STRING },
-  timestamp: { type: Sequelize.DATE, defaultValue: Sequelize.NOW },
+  employeeId: { type: DataTypes.INTEGER, references: { model: 'Employee', key: 'id' } },
+  type: { type: DataTypes.ENUM('check-in', 'check-out', 'visit'), allowNull: false },
+  details: { type: DataTypes.TEXT },
+  location: { type: DataTypes.STRING },
+  timestamp: { type: DataTypes.DATE, defaultValue: DataTypes.NOW },
 }, { timestamps: true });
 
-const State = sequelize.define('State', { name: { type: Sequelize.STRING, allowNull: false } }, { timestamps: true });
+const State = sequelize.define('State', { name: { type: DataTypes.STRING, allowNull: false } }, { timestamps: true });
+
 const City = sequelize.define('City', {
-  stateId: { type: Sequelize.INTEGER, references: { model: 'State', key: 'id' } },
-  stateName: { type: Sequelize.STRING },
-  name: { type: Sequelize.STRING, allowNull: false },
+  stateId: { type: DataTypes.INTEGER, references: { model: 'State', key: 'id' } },
+  stateName: { type: DataTypes.STRING },
+  name: { type: DataTypes.STRING, allowNull: false },
 }, { timestamps: true });
 
 const FollowUp = sequelize.define('FollowUp', {
-  employeeId: { type: Sequelize.INTEGER, references: { model: 'Employee', key: 'id' } },
-  subject: { type: Sequelize.STRING, allowNull: false },
-  datetime: { type: Sequelize.DATE, allowNull: false },
-  note: { type: Sequelize.TEXT },
+  employeeId: { type: DataTypes.INTEGER, references: { model: 'Employee', key: 'id' } },
+  subject: { type: DataTypes.STRING, allowNull: false },
+  datetime: { type: DataTypes.DATE, allowNull: false },
+  note: { type: DataTypes.TEXT },
 }, { timestamps: true });
 
-// Authentication Configuration
+// -------------------------
+// Auth config
 const authConfig = { secret: process.env.JWT_SECRET || 'defaultSecret', expiresIn: '1h' };
 
+// -------------------------
 // Controllers
 const authController = {
   register: async (req, res) => {
@@ -118,6 +120,7 @@ const employeeController = {
   },
 };
 
+// -------------------------
 // Routes
 const authRoutes = express.Router();
 authRoutes.post('/register', authController.register);
@@ -127,11 +130,12 @@ const employeeRoutes = express.Router();
 employeeRoutes.get('/', employeeController.getAllEmployees);
 employeeRoutes.post('/', employeeController.createEmployee);
 
+// -------------------------
 // Main Application
 const app = express();
 
 // Middleware
-app.use(cors()); // Allow all origins; restrict later if needed
+app.use(cors()); // Allow all origins; restrict in production
 app.use(helmet());
 app.use(morgan('dev'));
 app.use(express.json());
@@ -140,6 +144,7 @@ app.use(express.json());
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/employees', employeeRoutes);
 
+// -------------------------
 // Database Connection and Server Start
 (async () => {
   try {
