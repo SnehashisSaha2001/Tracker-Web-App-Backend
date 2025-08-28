@@ -106,6 +106,57 @@ async function migrate() {
 
 migrate().catch((err) => console.error("Migration error:", err));
 
+// ========== API ROUTES FROM tracker_backend_express_socket 2.js ==========
+
+// Example: Auth routes
+app.post("/api/auth/seed", async (req, res) => {
+  // logic to create org + admin
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  // logic to register new user
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  // logic to authenticate user
+});
+
+// Example: Task routes
+app.get("/api/tasks", async (req, res) => {
+  // logic to fetch tasks
+});
+
+app.post("/api/tasks", async (req, res) => {
+  // logic to create task
+});
+
+// Example: User routes
+app.get("/api/users", async (req, res) => {
+  // logic to fetch users
+});
+
+app.patch("/api/users/me", async (req, res) => {
+  // logic to update user profile
+});
+
+// Example: Location routes
+app.post("/api/locations", async (req, res) => {
+  // logic to save location
+});
+
+app.get("/api/locations/recent", async (req, res) => {
+  // logic to fetch recent locations
+});
+
+// Example: Backup routes
+app.post("/api/backups", async (req, res) => {
+  // logic to save backup
+});
+
+app.get("/api/backups", async (req, res) => {
+  // logic to fetch backups
+});
+
 // ✅ Test route
 app.get("/", (req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
