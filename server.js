@@ -1,3 +1,4 @@
+// tracker_backend_express_socket_full.js
 import express from "express";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
@@ -7,35 +8,69 @@ import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
+
 dotenv.config();
 
-/* ================== APP & SOCKET ================== */
+/* ---------------------------- App & Server ---------------------------- */
 const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
-    origin: process.env.CORS_ORIGINS?.split(",") || ["*"],
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    origin: (process.env.CORS_ORIGINS?.split(",") ?? ["*"]).map(s => s.trim()),
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     credentials: true,
   },
 });
-
-app.use(cors({ origin: process.env.CORS_ORIGINS?.split(",") || true, credentials: true }));
+app.use(cors());
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-/* ================== DATABASE ================== */
+/* ----------------------------- Postgres ------------------------------ */
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-/* ================== MIGRATIONS ================== */
+/* -------------------------- Helper Utilities ------------------------- */
+const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+function signToken(user) {
+  return jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "1d" });
+}
+
+function authenticate(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing token" });
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ error: "Invalid token" });
+    req.user = decoded;
+    next();
+  });
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    next();
+  };
+}
+
+/* ------------------------------- Migrate ----------------------------- */
 async function migrate() {
   const client = await pool.connect();
   try {
     await client.query(`
       CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+      DO $$ BEGIN
+        CREATE TYPE user_role AS ENUM ('admin','employee');
+      EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+      DO $$ BEGIN
+        CREATE TYPE activity_type AS ENUM ('checkin','checkout','visit');
+      EXCEPTION WHEN duplicate_object THEN null; END $$;
 
       CREATE TABLE IF NOT EXISTS orgs (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -43,13 +78,9 @@ async function migrate() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
-      DO $$ BEGIN
-        CREATE TYPE user_role AS ENUM ('admin','employee');
-      EXCEPTION WHEN duplicate_object THEN null; END $$;
-
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        org_id UUID REFERENCES orgs(id) ON DELETE CASCADE,
+        org_id UUID REFERENCES orgs(id) ON DELETE SET NULL,
         role user_role NOT NULL,
         name TEXT NOT NULL,
         email TEXT UNIQUE,
@@ -62,450 +93,562 @@ async function migrate() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
+      CREATE TABLE IF NOT EXISTS states (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT UNIQUE NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS cities (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        state_id UUID NOT NULL REFERENCES states(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(state_id, name)
+      );
+
       CREATE TABLE IF NOT EXISTS activities (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        type TEXT NOT NULL,            -- e.g., checkin | checkout | visit | note
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type activity_type NOT NULL,
         details TEXT,
-        location TEXT,
         latitude DOUBLE PRECISION,
         longitude DOUBLE PRECISION,
+        address TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
       CREATE TABLE IF NOT EXISTS followups (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         subject TEXT NOT NULL,
         note TEXT,
-        followup_time TIMESTAMPTZ NOT NULL,
+        datetime TIMESTAMPTZ NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        org_id UUID REFERENCES orgs(id) ON DELETE SET NULL,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT NOT NULL DEFAULT 'todo',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS locations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        latitude DOUBLE PRECISION NOT NULL,
+        longitude DOUBLE PRECISION NOT NULL,
+        address TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS backups (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        data JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE OR REPLACE FUNCTION set_updated_at()
+      RETURNS TRIGGER AS $$
+      BEGIN NEW.updated_at = now(); RETURN NEW; END $$ LANGUAGE plpgsql;
+
+      DO $$ BEGIN
+        CREATE TRIGGER trg_users_updated BEFORE UPDATE ON users
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+      DO $$ BEGIN
+        CREATE TRIGGER trg_tasks_updated BEFORE UPDATE ON tasks
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      EXCEPTION WHEN duplicate_object THEN null; END $$;
     `);
     console.log("✅ Migration complete");
-  } catch (e) {
-    console.error("Migration error:", e);
   } finally {
     client.release();
   }
 }
-migrate();
+migrate().catch((e) => console.error("Migration error:", e));
 
-/* ================== SOCKET.IO ================== */
-io.on("connection", (socket) => {
-  console.log("🔌 Client connected:", socket.id);
-  socket.on("disconnect", () => console.log("❌ Client disconnected:", socket.id));
-});
+/* ------------------------------ AUTH ------------------------------- */
+// Seed: create org + admin (first-time setup). Safe: only when no admin exists.
+app.post("/api/auth/seed", asyncRoute(async (req, res) => {
+  const { orgName, name, email, mobile, employeeId, password } = req.body;
+  const { rows: adminCount } = await pool.query("SELECT count(*)::int AS c FROM users WHERE role='admin'");
+  if (adminCount[0].c > 0) return res.status(400).json({ error: "Admin already exists" });
 
-/* ================== AUTH HELPERS ================== */
-function bearer(req) {
-  const h = req.headers["authorization"];
-  if (!h) return null;
-  const [t, v] = h.split(" ");
-  if (!t || t.toLowerCase() !== "bearer") return null;
-  return v || null;
-}
-
-function authRequired(req, res, next) {
-  try {
-    const token = bearer(req);
-    if (!token) return res.status(401).json({ error: "Missing bearer token" });
-    const payload = jwt.verify(token, process.env.JWT_SECRET || "secret");
-    req.user = { id: payload.id, role: payload.role };
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-}
-
-function requireRole(...roles) {
-  return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-    next();
-  };
-}
-
-/* ================== AUTH ROUTES ================== */
-// Seed org + admin
-app.post("/api/auth/seed", async (req, res) => {
   const client = await pool.connect();
   try {
-    const {
-      orgName = "Default Org",
-      adminName = "Admin",
-      adminEmail,
-      adminMobile,
-      adminPassword = "admin123",
-    } = req.body;
-
-    const org = (
-      await client.query(`INSERT INTO orgs (name) VALUES ($1) RETURNING *`, [orgName])
-    ).rows[0];
-
-    const empId = "ADM-" + Math.floor(1000 + Math.random() * 9000);
-    const hash = await bcrypt.hash(adminPassword, 10);
-
-    const admin = (
-      await client.query(
-        `INSERT INTO users (org_id, role, name, email, employee_id, mobile, password_hash)
-         VALUES ($1,'admin',$2,$3,$4,$5,$6)
-         RETURNING id, name, email, employee_id, mobile, role`,
-        [org.id, adminName, adminEmail, empId, adminMobile, hash]
-      )
-    ).rows[0];
-
-    res.json({ org, admin });
+    await client.query("BEGIN");
+    const org = await client.query(
+      "INSERT INTO orgs (name) VALUES ($1) RETURNING id, name",
+      [orgName || "Default Org"]
+    );
+    const hash = await bcrypt.hash(password, 10);
+    const admin = await client.query(
+      `INSERT INTO users (org_id, role, name, email, mobile, employee_id, password_hash)
+       VALUES ($1,'admin',$2,$3,$4,$5,$6)
+       RETURNING id, role, name, email, mobile, employee_id`,
+      [org.rows[0].id, name, email, mobile, employeeId, hash]
+    );
+    await client.query("COMMIT");
+    const user = admin.rows[0];
+    const token = signToken(user);
+    res.json({ token, user });
   } catch (e) {
-    console.error("Seed error:", e);
-    res.status(500).json({ error: "Failed to seed database" });
+    await client.query("ROLLBACK");
+    console.error(e);
+    res.status(500).json({ error: "Seed failed" });
   } finally {
     client.release();
   }
-});
+}));
 
-// Login (employeeId + mobile + password)
-app.post("/api/auth/login", async (req, res) => {
-  const { employeeId, mobile, password } = req.body;
-  if (!employeeId || !mobile || !password) {
-    return res.status(400).json({ error: "employeeId, mobile and password required" });
+// Register: if there is an admin already, only admins can create others.
+// If no users exist (fresh DB), allow open self-register as admin.
+app.post("/api/auth/register", asyncRoute(async (req, res) => {
+  const { name, email, mobile, employeeId, password, role = "employee" } = req.body;
+
+  const { rows: cntRows } = await pool.query("SELECT count(*)::int AS c FROM users");
+  const isFresh = cntRows[0].c === 0;
+  if (!isFresh) {
+    // Require auth + admin when not fresh
+    const auth = req.headers.authorization || "";
+    if (!auth.startsWith("Bearer ")) return res.status(401).json({ error: "Missing token" });
+    try {
+      const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
+      if (decoded.role !== "admin") return res.status(403).json({ error: "Only admin can register users" });
+    } catch {
+      return res.status(403).json({ error: "Invalid token" });
+    }
   }
-  try {
-    const { rows } = await pool.query(
-      `SELECT * FROM users WHERE employee_id = $1 AND mobile = $2`,
-      [employeeId, mobile]
-    );
-    const user = rows[0];
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+  const finalRole = isFresh ? "admin" : role === "admin" ? "admin" : "employee";
+  const hash = await bcrypt.hash(password, 10);
 
-    const token = jwt.sign(
-      { id: user.id, role: user.role },
-      process.env.JWT_SECRET || "secret",
-      { expiresIn: "7d" }
-    );
-
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        employeeId: user.employee_id,
-        name: user.name,
-        mobile: user.mobile,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (e) {
-    console.error("Login error:", e);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-/* ================== PROFILE ================== */
-app.get("/api/users/me", authRequired, async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT id, org_id, role, name, email, employee_id, mobile, photo_url, created_at, updated_at
-     FROM users WHERE id = $1`,
-    [req.user.id]
+    `INSERT INTO users (role, name, email, mobile, employee_id, password_hash)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     RETURNING id, role, name, email, mobile, employee_id`,
+    [finalRole, name, email, mobile, employeeId, hash]
+  );
+  const user = rows[0];
+  const token = signToken(user);
+  res.json({ token, user });
+}));
+
+// Login
+app.post("/api/auth/login", asyncRoute(async (req, res) => {
+  const { employeeId, mobile, email, password } = req.body;
+  if (!password) return res.status(400).json({ error: "Password required" });
+
+  const { rows } = await pool.query(
+    `SELECT * FROM users
+     WHERE ($1::text IS NOT NULL AND employee_id=$1)
+        OR ($2::text IS NOT NULL AND mobile=$2)
+        OR ($3::text IS NOT NULL AND email=$3)
+     LIMIT 1`,
+    [employeeId || null, mobile || null, email || null]
+  );
+  const user = rows[0];
+  if (!user) return res.status(400).json({ error: "User not found" });
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) return res.status(400).json({ error: "Invalid credentials" });
+
+  const token = signToken(user);
+  await pool.query("UPDATE users SET last_seen = now() WHERE id=$1", [user.id]);
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      role: user.role,
+      name: user.name,
+      email: user.email,
+      mobile: user.mobile,
+      employeeId: user.employee_id,
+      photoUrl: user.photo_url,
+    },
+  });
+}));
+
+/* ------------------------------ USERS ------------------------------ */
+app.get("/api/users", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT id, role, name, email, mobile, employee_id AS \"employeeId\", photo_url AS \"photoUrl\", created_at FROM users ORDER BY created_at DESC"
+  );
+  res.json({ users: rows });
+}));
+
+app.post("/api/users", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { name, email, mobile, employeeId, password, role = "employee" } = req.body;
+  const hash = await bcrypt.hash(password, 10);
+  const { rows } = await pool.query(
+    `INSERT INTO users (role, name, email, mobile, employee_id, password_hash)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     RETURNING id, role, name, email, mobile, employee_id AS "employeeId"`,
+    [role, name, email, mobile, employeeId, hash]
   );
   res.json({ user: rows[0] });
-});
+}));
 
-app.patch("/api/users/me", authRequired, async (req, res) => {
-  const { name, email, mobile, password, photoUrl } = req.body;
-  try {
-    let fields = [];
-    let params = [];
-    let i = 1;
+app.patch("/api/users/:id", authenticate, asyncRoute(async (req, res) => {
+  const { id } = req.params;
+  const { name, email, mobile, password, role, photoUrl } = req.body;
 
-    if (name) { fields.push(`name=$${i++}`); params.push(name); }
-    if (email) { fields.push(`email=$${i++}`); params.push(email); }
-    if (mobile) { fields.push(`mobile=$${i++}`); params.push(mobile); }
-    if (photoUrl) { fields.push(`photo_url=$${i++}`); params.push(photoUrl); }
-    if (password) {
-      const hash = await bcrypt.hash(password, 10);
-      fields.push(`password_hash=$${i++}`);
-      params.push(hash);
-    }
-
-    if (!fields.length) return res.json({ ok: true });
-    params.push(req.user.id);
-
-    const { rows } = await pool.query(
-      `UPDATE users SET ${fields.join(", ")}, updated_at=now()
-       WHERE id=$${i}
-       RETURNING id, name, email, employee_id, mobile, photo_url, updated_at`,
-      params
-    );
-    res.json({ user: rows[0] });
-  } catch (e) {
-    console.error("Update profile error:", e);
-    res.status(500).json({ error: "Failed to update profile" });
+  if (req.user.role !== "admin" && req.user.id !== id) {
+    return res.status(403).json({ error: "Forbidden" });
   }
-});
 
-/* ================== EMPLOYEE MANAGEMENT (ADMIN) ================== */
-app.get("/api/employees", authRequired, requireRole("admin"), async (req, res) => {
+  const fields = [];
+  const values = [];
+  let idx = 1;
+
+  if (name !== undefined) { fields.push(`name=$${idx++}`); values.push(name); }
+  if (email !== undefined) { fields.push(`email=$${idx++}`); values.push(email); }
+  if (mobile !== undefined) { fields.push(`mobile=$${idx++}`); values.push(mobile); }
+  if (photoUrl !== undefined) { fields.push(`photo_url=$${idx++}`); values.push(photoUrl); }
+  if (role !== undefined && req.user.role === "admin") { fields.push(`role=$${idx++}`); values.push(role); }
+  if (password) {
+    const hash = await bcrypt.hash(password, 10);
+    fields.push(`password_hash=$${idx++}`); values.push(hash);
+  }
+  if (!fields.length) return res.json({ ok: true });
+
+  values.push(id);
   const { rows } = await pool.query(
-    `SELECT id, name, email, employee_id, mobile, role, photo_url, created_at
-     FROM users
-     WHERE org_id=(SELECT org_id FROM users WHERE id=$1)
-     ORDER BY created_at DESC`,
-    [req.user.id]
+    `UPDATE users SET ${fields.join(", ")} WHERE id=$${idx} RETURNING id, role, name, email, mobile, employee_id AS "employeeId", photo_url AS "photoUrl"`,
+    values
+  );
+  res.json({ user: rows[0] });
+}));
+
+app.delete("/api/users/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { id } = req.params;
+  await pool.query("DELETE FROM users WHERE id=$1", [id]);
+  res.json({ ok: true });
+}));
+
+app.patch("/api/users/me", authenticate, asyncRoute(async (req, res) => {
+  req.params.id = req.user.id;
+  return app._router.handle(req, res); // will fall into /api/users/:id via same request
+}));
+
+/* ------------------------------ ADMINS ----------------------------- */
+app.get("/api/admins", authenticate, requireRole("admin"), asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(
+    "SELECT id, name, email, mobile, employee_id AS \"employeeId\" FROM users WHERE role='admin' ORDER BY created_at DESC"
+  );
+  res.json({ admins: rows });
+}));
+app.post("/api/admins", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { name, email, mobile, employeeId, password } = req.body;
+  const hash = await bcrypt.hash(password, 10);
+  const { rows } = await pool.query(
+    `INSERT INTO users (role, name, email, mobile, employee_id, password_hash)
+     VALUES ('admin',$1,$2,$3,$4,$5)
+     RETURNING id, name, email, mobile, employee_id AS "employeeId"`,
+    [name, email, mobile, employeeId, hash]
+  );
+  res.json({ admin: rows[0] });
+}));
+app.delete("/api/admins/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  await pool.query("DELETE FROM users WHERE id=$1 AND role='admin'", [req.params.id]);
+  res.json({ ok: true });
+}));
+
+/* ---------------------------- EMPLOYEES ---------------------------- */
+app.get("/api/employees", authenticate, requireRole("admin"), asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(
+    "SELECT id, name, email, mobile, employee_id AS \"employeeId\" FROM users WHERE role='employee' ORDER BY created_at DESC"
   );
   res.json({ employees: rows });
-});
+}));
+app.post("/api/employees", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { name, email, mobile, employeeId, password } = req.body;
+  const hash = await bcrypt.hash(password, 10);
+  const { rows } = await pool.query(
+    `INSERT INTO users (role, name, email, mobile, employee_id, password_hash)
+     VALUES ('employee',$1,$2,$3,$4,$5)
+     RETURNING id, name, email, mobile, employee_id AS "employeeId"`,
+    [name, email, mobile, employeeId, hash]
+  );
+  res.json({ employee: rows[0] });
+}));
+app.delete("/api/employees/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  await pool.query("DELETE FROM users WHERE id=$1 AND role='employee'", [req.params.id]);
+  res.json({ ok: true });
+}));
 
-app.post("/api/employees", authRequired, requireRole("admin"), async (req, res) => {
-  const { name, email, mobile, password, role = "employee" } = req.body;
-  try {
-    const orgId = (
-      await pool.query(`SELECT org_id FROM users WHERE id=$1`, [req.user.id])
-    ).rows[0].org_id;
+/* ----------------------------- STATES ------------------------------ */
+app.get("/api/states", authenticate, asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query("SELECT id, name FROM states ORDER BY name ASC");
+  res.json({ states: rows });
+}));
+app.post("/api/states", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { name } = req.body;
+  const { rows } = await pool.query(
+    "INSERT INTO states (name) VALUES ($1) RETURNING id, name",
+    [name]
+  );
+  res.json({ state: rows[0] });
+}));
+app.delete("/api/states/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  await pool.query("DELETE FROM states WHERE id=$1", [req.params.id]);
+  res.json({ ok: true });
+}));
 
-    const empId = "EMP-" + Math.floor(1000 + Math.random() * 9000);
-    const hash = await bcrypt.hash(password, 10);
+/* ------------------------------ CITIES ----------------------------- */
+app.get("/api/cities", authenticate, asyncRoute(async (req, res) => {
+  const { stateId } = req.query;
+  let q = "SELECT id, state_id AS \"stateId\", name FROM cities";
+  const vals = [];
+  if (stateId) { q += " WHERE state_id=$1"; vals.push(stateId); }
+  q += " ORDER BY name ASC";
+  const { rows } = await pool.query(q, vals);
+  res.json({ cities: rows });
+}));
+app.post("/api/cities", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  const { stateId, name } = req.body;
+  const { rows } = await pool.query(
+    "INSERT INTO cities (state_id, name) VALUES ($1,$2) RETURNING id, state_id AS \"stateId\", name",
+    [stateId, name]
+  );
+  res.json({ city: rows[0] });
+}));
+app.delete("/api/cities/:id", authenticate, requireRole("admin"), asyncRoute(async (req, res) => {
+  await pool.query("DELETE FROM cities WHERE id=$1", [req.params.id]);
+  res.json({ ok: true });
+}));
 
-    const { rows } = await pool.query(
-      `INSERT INTO users (org_id, role, name, email, employee_id, mobile, password_hash)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING id, name, email, employee_id, mobile, role`,
-      [orgId, role, name, email, empId, mobile, hash]
-    );
-    res.json({ employee: rows[0] });
-  } catch (e) {
-    console.error("Add employee error:", e);
-    res.status(500).json({ error: "Failed to add employee" });
+/* ---------------------------- ACTIVITIES --------------------------- */
+app.get("/api/activities", authenticate, asyncRoute(async (req, res) => {
+  const { userId, type, from, to, limit = 50, offset = 0 } = req.query;
+
+  const conds = [];
+  const vals = [];
+  let idx = 1;
+
+  if (userId) { conds.push(`user_id=$${idx++}`); vals.push(userId); }
+  if (type) { conds.push(`type=$${idx++}::activity_type`); vals.push(type); }
+  if (from) { conds.push(`created_at >= $${idx++}`); vals.push(new Date(from)); }
+  if (to) { conds.push(`created_at <= $${idx++}`); vals.push(new Date(to)); }
+
+  // Non-admins see only their own
+  if (req.user.role !== "admin") {
+    conds.push(`user_id=$${idx++}`);
+    vals.push(req.user.id);
   }
-});
 
-app.patch("/api/employees/:id", authRequired, requireRole("admin"), async (req, res) => {
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const { rows } = await pool.query(
+    `SELECT id, user_id AS "userId", type, details, latitude, longitude, address, created_at
+     FROM activities ${where}
+     ORDER BY created_at DESC
+     LIMIT $${idx++} OFFSET $${idx}`,
+    [...vals, Number(limit), Number(offset)]
+  );
+  res.json({ activities: rows });
+}));
+
+app.post("/api/activities", authenticate, asyncRoute(async (req, res) => {
+  const { type, details, latitude, longitude, address } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO activities (user_id, type, details, latitude, longitude, address)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     RETURNING id, user_id AS "userId", type, details, latitude, longitude, address, created_at`,
+    [req.user.id, type, details || null, latitude ?? null, longitude ?? null, address ?? null]
+  );
+  const activity = rows[0];
+  io.emit("activity:new", activity);
+  res.json({ activity });
+}));
+
+/* ----------------------------- FOLLOWUPS --------------------------- */
+app.get("/api/followups", authenticate, asyncRoute(async (req, res) => {
+  const { userId, from, to, limit = 100, offset = 0 } = req.query;
+
+  const conds = [];
+  const vals = [];
+  let idx = 1;
+
+  if (userId && req.user.role === "admin") { conds.push(`user_id=$${idx++}`); vals.push(userId); }
+  if (from) { conds.push(`datetime >= $${idx++}`); vals.push(new Date(from)); }
+  if (to) { conds.push(`datetime <= $${idx++}`); vals.push(new Date(to)); }
+
+  if (req.user.role !== "admin") {
+    conds.push(`user_id=$${idx++}`); vals.push(req.user.id);
+  }
+
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const { rows } = await pool.query(
+    `SELECT id, user_id AS "userId", subject, note, datetime, created_at
+     FROM followups ${where}
+     ORDER BY datetime DESC
+     LIMIT $${idx++} OFFSET $${idx}`,
+    [...vals, Number(limit), Number(offset)]
+  );
+  res.json({ followups: rows });
+}));
+
+app.post("/api/followups", authenticate, asyncRoute(async (req, res) => {
+  const { subject, note, datetime } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO followups (user_id, subject, note, datetime)
+     VALUES ($1,$2,$3,$4)
+     RETURNING id, user_id AS "userId", subject, note, datetime, created_at`,
+    [req.user.id, subject, note ?? null, new Date(datetime)]
+  );
+  const followup = rows[0];
+  io.emit("followup:new", followup);
+  res.json({ followup });
+}));
+
+app.patch("/api/followups/:id", authenticate, asyncRoute(async (req, res) => {
   const { id } = req.params;
-  const { name, email, mobile, role } = req.body;
-  try {
-    const { rows } = await pool.query(
-      `UPDATE users SET
-         name=COALESCE($1,name),
-         email=COALESCE($2,email),
-         mobile=COALESCE($3,mobile),
-         role=COALESCE($4,role),
-         updated_at=now()
-       WHERE id=$5
-       RETURNING id, name, email, employee_id, mobile, role, updated_at`,
-      [name, email, mobile, role, id]
-    );
-    res.json({ employee: rows[0] });
-  } catch (e) {
-    console.error("Update employee error:", e);
-    res.status(500).json({ error: "Failed to update employee" });
+
+  // owner or admin only
+  const { rows: ownerRows } = await pool.query("SELECT user_id FROM followups WHERE id=$1", [id]);
+  if (!ownerRows.length) return res.status(404).json({ error: "Not found" });
+  if (req.user.role !== "admin" && ownerRows[0].user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
   }
+
+  const { subject, note, datetime } = req.body;
+  const fields = [], vals = []; let idx = 1;
+  if (subject !== undefined) { fields.push(`subject=$${idx++}`); vals.push(subject); }
+  if (note !== undefined) { fields.push(`note=$${idx++}`); vals.push(note); }
+  if (datetime !== undefined) { fields.push(`datetime=$${idx++}`); vals.push(new Date(datetime)); }
+  if (!fields.length) return res.json({ ok: true });
+
+  vals.push(id);
+  const { rows } = await pool.query(
+    `UPDATE followups SET ${fields.join(", ")} WHERE id=$${idx}
+     RETURNING id, user_id AS "userId", subject, note, datetime, created_at`,
+    vals
+  );
+  res.json({ followup: rows[0] });
+}));
+
+app.delete("/api/followups/:id", authenticate, asyncRoute(async (req, res) => {
+  const { id } = req.params;
+  const { rows: ownerRows } = await pool.query("SELECT user_id FROM followups WHERE id=$1", [id]);
+  if (!ownerRows.length) return res.status(404).json({ error: "Not found" });
+  if (req.user.role !== "admin" && ownerRows[0].user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  await pool.query("DELETE FROM followups WHERE id=$1", [id]);
+  res.json({ ok: true });
+}));
+
+/* ------------------------------ TASKS ------------------------------ */
+app.get("/api/tasks", authenticate, asyncRoute(async (req, res) => {
+  const conds = [], vals = []; let idx = 1;
+  if (req.user.role !== "admin") { conds.push(`user_id=$${idx++}`); vals.push(req.user.id); }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  const { rows } = await pool.query(`SELECT * FROM tasks ${where} ORDER BY created_at DESC`, vals);
+  res.json({ tasks: rows });
+}));
+
+app.post("/api/tasks", authenticate, asyncRoute(async (req, res) => {
+  const { title, description, status = "todo", userId } = req.body;
+  const targetUser = req.user.role === "admin" && userId ? userId : req.user.id;
+  const { rows } = await pool.query(
+    `INSERT INTO tasks (user_id, title, description, status)
+     VALUES ($1,$2,$3,$4) RETURNING *`,
+    [targetUser, title, description ?? null, status]
+  );
+  res.json({ task: rows[0] });
+}));
+
+app.patch("/api/tasks/:id", authenticate, asyncRoute(async (req, res) => {
+  const { id } = req.params;
+
+  // owner or admin
+  const { rows: tRows } = await pool.query("SELECT user_id FROM tasks WHERE id=$1", [id]);
+  if (!tRows.length) return res.status(404).json({ error: "Not found" });
+  if (req.user.role !== "admin" && tRows[0].user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const { title, description, status } = req.body;
+  const fields = [], vals = []; let idx = 1;
+  if (title !== undefined) { fields.push(`title=$${idx++}`); vals.push(title); }
+  if (description !== undefined) { fields.push(`description=$${idx++}`); vals.push(description); }
+  if (status !== undefined) { fields.push(`status=$${idx++}`); vals.push(status); }
+  if (!fields.length) return res.json({ ok: true });
+
+  vals.push(id);
+  const { rows } = await pool.query(
+    `UPDATE tasks SET ${fields.join(", ")} WHERE id=$${idx} RETURNING *`,
+    vals
+  );
+  res.json({ task: rows[0] });
+}));
+
+app.delete("/api/tasks/:id", authenticate, asyncRoute(async (req, res) => {
+  const { id } = req.params;
+  const { rows: tRows } = await pool.query("SELECT user_id FROM tasks WHERE id=$1", [id]);
+  if (!tRows.length) return res.status(404).json({ error: "Not found" });
+  if (req.user.role !== "admin" && tRows[0].user_id !== req.user.id) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  await pool.query("DELETE FROM tasks WHERE id=$1", [id]);
+  res.json({ ok: true });
+}));
+
+/* ----------------------------- LOCATIONS --------------------------- */
+app.post("/api/locations", authenticate, asyncRoute(async (req, res) => {
+  const { latitude, longitude, address } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO locations (user_id, latitude, longitude, address)
+     VALUES ($1,$2,$3,$4) RETURNING *`,
+    [req.user.id, latitude, longitude, address ?? null]
+  );
+  res.json({ location: rows[0] });
+}));
+app.get("/api/locations/recent", authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT * FROM locations WHERE user_id=$1 ORDER BY created_at DESC LIMIT 10",
+    [req.user.id]
+  );
+  res.json({ locations: rows });
+}));
+
+/* ------------------------------ BACKUPS ---------------------------- */
+app.post("/api/backups", authenticate, asyncRoute(async (req, res) => {
+  const { data } = req.body;
+  const { rows } = await pool.query(
+    "INSERT INTO backups (user_id, data) VALUES ($1,$2) RETURNING *",
+    [req.user.id, data]
+  );
+  res.json({ backup: rows[0] });
+}));
+app.get("/api/backups", authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    "SELECT * FROM backups WHERE user_id=$1 ORDER BY created_at DESC",
+    [req.user.id]
+  );
+  res.json({ backups: rows });
+}));
+
+/* ------------------------------ Health ----------------------------- */
+app.get("/", (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-app.delete("/api/employees/:id", authRequired, requireRole("admin"), async (req, res) => {
-  try {
-    await pool.query(`DELETE FROM users WHERE id=$1`, [req.params.id]);
-    res.json({ success: true });
-  } catch (e) {
-    console.error("Delete employee error:", e);
-    res.status(500).json({ error: "Failed to delete employee" });
-  }
+/* ----------------------------- Errors ------------------------------ */
+app.use((err, _req, res, _next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal Server Error" });
 });
 
-/* ================== ACTIVITIES ================== */
-app.post("/api/activities", authRequired, async (req, res) => {
-  const { type, details, location, latitude, longitude } = req.body;
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO activities (user_id, type, details, location, latitude, longitude)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING *`,
-      [req.user.id, type, details, location, latitude, longitude]
-    );
-    const activity = rows[0];
-    io.emit("activity:new", activity); // global broadcast (single-org app)
-    res.json({ activity });
-  } catch (e) {
-    console.error("Add activity error:", e);
-    res.status(500).json({ error: "Failed to add activity" });
-  }
-});
-
-app.get("/api/activities", authRequired, async (req, res) => {
-  try {
-    let query = `
-      SELECT a.*, u.name, u.employee_id
-      FROM activities a
-      JOIN users u ON a.user_id = u.id
-      WHERE u.org_id = (SELECT org_id FROM users WHERE id=$1)
-    `;
-    const params = [req.user.id];
-
-    if (req.user.role !== "admin") {
-      // employee sees only their own
-      query += ` AND a.user_id = $1`;
-    }
-
-    query += ` ORDER BY a.created_at DESC`;
-
-    const { rows } = await pool.query(query, params);
-    res.json({ activities: rows });
-  } catch (e) {
-    console.error("Fetch activities error:", e);
-    res.status(500).json({ error: "Failed to fetch activities" });
-  }
-});
-
-/* ================== FOLLOWUPS ================== */
-app.post("/api/followups", authRequired, async (req, res) => {
-  const { subject, note, followupTime } = req.body;
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO followups (user_id, subject, note, followup_time)
-       VALUES ($1,$2,$3,$4)
-       RETURNING *`,
-      [req.user.id, subject, note, followupTime]
-    );
-    const followup = rows[0];
-    io.emit("followup:new", followup); // global broadcast (single-org app)
-    res.json({ followup });
-  } catch (e) {
-    console.error("Add followup error:", e);
-    res.status(500).json({ error: "Failed to add followup" });
-  }
-});
-
-app.get("/api/followups", authRequired, async (req, res) => {
-  try {
-    let query = `
-      SELECT f.*, u.name, u.employee_id
-      FROM followups f
-      JOIN users u ON f.user_id = u.id
-      WHERE u.org_id = (SELECT org_id FROM users WHERE id=$1)
-    `;
-    const params = [req.user.id];
-
-    if (req.user.role !== "admin") {
-      query += ` AND f.user_id = $1`;
-    }
-
-    query += ` ORDER BY f.followup_time DESC`;
-
-    const { rows } = await pool.query(query, params);
-    res.json({ followups: rows });
-  } catch (e) {
-    console.error("Fetch followups error:", e);
-    res.status(500).json({ error: "Failed to fetch followups" });
-  }
-});
-
-/* ================== OFFLINE SYNC ================== */
-app.post("/api/sync", authRequired, async (req, res) => {
-  const { queue } = req.body;
-  if (!Array.isArray(queue)) return res.status(400).json({ error: "queue must be array" });
-  try {
-    for (const item of queue) {
-      if (item.type === "activity") {
-        const d = item.data || {};
-        const { rows } = await pool.query(
-          `INSERT INTO activities (user_id, type, details, location, latitude, longitude)
-           VALUES ($1,$2,$3,$4,$5,$6)
-           RETURNING *`,
-          [req.user.id, d.type, d.details, d.location, d.latitude, d.longitude]
-        );
-        io.emit("activity:new", rows[0]);
-      } else if (item.type === "followup") {
-        const d = item.data || {};
-        const { rows } = await pool.query(
-          `INSERT INTO followups (user_id, subject, note, followup_time)
-           VALUES ($1,$2,$3,$4)
-           RETURNING *`,
-          [req.user.id, d.subject, d.note, d.followupTime]
-        );
-        io.emit("followup:new", rows[0]);
-      }
-    }
-    res.json({ success: true });
-  } catch (e) {
-    console.error("Sync error:", e);
-    res.status(500).json({ error: "Failed to sync data" });
-  }
-});
-
-/* ================== DASHBOARD ================== */
-app.get("/api/dashboard", authRequired, async (req, res) => {
-  try {
-    const { rows: orgRow } = await pool.query(
-      `SELECT org_id FROM users WHERE id=$1`,
-      [req.user.id]
-    );
-    const orgId = orgRow[0].org_id;
-    let data = {};
-
-    if (req.user.role === "admin") {
-      const activities = await pool.query(
-        `SELECT a.type, COUNT(*)::int AS count
-         FROM activities a
-         JOIN users u ON a.user_id=u.id
-         WHERE u.org_id=$1
-         GROUP BY a.type`,
-        [orgId]
-      );
-
-      const followupsDue = await pool.query(
-        `SELECT COUNT(*)::int AS count
-         FROM followups f
-         JOIN users u ON f.user_id=u.id
-         WHERE u.org_id=$1 AND f.followup_time >= now()`,
-        [orgId]
-      );
-
-      const employeeCount = await pool.query(
-        `SELECT COUNT(*)::int AS count
-         FROM users
-         WHERE org_id=$1 AND role='employee'`,
-        [orgId]
-      );
-
-      data = {
-        employees: employeeCount.rows[0].count,
-        followupsDue: followupsDue.rows[0].count,
-        activityStats: activities.rows, // [{ type, count }]
-      };
-    } else {
-      const activities = await pool.query(
-        `SELECT type, COUNT(*)::int AS count
-         FROM activities
-         WHERE user_id=$1
-         GROUP BY type`,
-        [req.user.id]
-      );
-      const followupsDue = await pool.query(
-        `SELECT COUNT(*)::int AS count
-         FROM followups
-         WHERE user_id=$1 AND followup_time >= now()`,
-        [req.user.id]
-      );
-      data = {
-        followupsDue: followupsDue.rows[0].count,
-        activityStats: activities.rows,
-      };
-    }
-
-    res.json({ dashboard: data });
-  } catch (e) {
-    console.error("Dashboard error:", e);
-    res.status(500).json({ error: "Failed to fetch dashboard data" });
-  }
-});
-
-/* ================== HEALTH ================== */
-app.get("/", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
-
-/* ================== START ================== */
+/* ----------------------------- Start ------------------------------- */
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
