@@ -296,14 +296,6 @@ const seedData = [
     "password": "scube@4321"
   },
   {
-    "name": "Shubhadarshani Nath",
-    "role": "employee",
-    "email": "shubhadarshani@scube.co.in",
-    "mobile": "7978143152",
-    "employee_id": "SCS-067404",
-    "password": "scube@4321"
-  },
-  {
     "name": "Kishan Kanodia",
     "role": "employee",
     "email": "kishan@scube.co.in",
