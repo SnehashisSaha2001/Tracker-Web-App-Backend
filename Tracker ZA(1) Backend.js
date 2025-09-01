@@ -8,19 +8,31 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { body, validationResult } from "express-validator";
 import dotenv from "dotenv";
+
 dotenv.config();
 
 /* ---------------------------- App & Server ---------------------------- */
 const app = express();
 const server = http.createServer(app);
+
+// Get frontend URL from environment or use default
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+
 const io = new SocketIOServer(server, { 
   cors: { 
-    origin: "*", 
-    methods: ["GET","POST","PUT","PATCH","DELETE"] 
+    origin: [FRONTEND_URL, "http://localhost:3000"], 
+    methods: ["GET","POST","PUT","PATCH","DELETE"],
+    credentials: true
   } 
 });
 
-app.use(cors());
+// Updated CORS configuration
+app.use(cors({
+  origin: [FRONTEND_URL, "http://localhost:3000"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+  credentials: true
+}));
+
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 
@@ -943,7 +955,11 @@ app.get("/api/backups", authenticate, async (req, res) => {
 });
 
 /* ----------------------------- Health ------------------------------- */
-app.get("/", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
+app.get("/", (req, res) => res.json({ 
+  ok: true, 
+  uptime: process.uptime(),
+  frontend: FRONTEND_URL
+}));
 
 /* ----------------------------- Start ------------------------------- */
 migrate().then(seedUsers).catch(console.error);
