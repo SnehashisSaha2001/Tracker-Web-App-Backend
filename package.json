@@ -2,12 +2,12 @@
   "name": "tracker-backend",
   "version": "1.0.0",
   "description": "Backend for Tracker App with geocoding and real-time features",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "migrate": "node -e \"require('./index.js').migrate()\"",
-    "seed": "SEED_DATA=true node -e \"require('./index.js').seedData()\"",
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node -e \"require('./server.js').migrate()\"",
+    "seed": "SEED_DATA=true node -e \"require('./server.js').seedData()\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
