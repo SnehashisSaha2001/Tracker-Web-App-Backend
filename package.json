@@ -1,27 +1,39 @@
 {
   "name": "tracker-backend",
   "version": "1.0.0",
-  "description": "Backend for Tracker Web App",
-  "main": "server.js",
-  "type": "module",
+  "description": "Backend for Tracker App with geocoding and real-time features",
+  "main": "index.js",
   "scripts": {
-    "start": "NODE_ENV=production node server.js",
-    "dev": "NODE_ENV=development nodemon server.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "migrate": "node -e \"require('./index.js').migrate()\"",
+    "seed": "SEED_DATA=true node -e \"require('./index.js').seedData()\"",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "tracker",
+    "geocoding",
+    "realtime",
+    "attendance",
+    "nodejs",
+    "express"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "helmet": "^7.1.0",
-    "pg": "^8.11.3",
-    "socket.io": "^4.7.5",
-    "jsonwebtoken": "^9.0.2"
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "helmet": "^6.1.5",
+    "jsonwebtoken": "^9.0.0",
+    "pg": "^8.11.0",
+    "socket.io": "^4.6.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^2.0.22"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=16.0.0"
   }
 }
