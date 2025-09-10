@@ -6,8 +6,9 @@ import helmet from "helmet";
 import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import { Pool } from "pg";
-dotenv.config();
+import axios from "axios";
 
+dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
@@ -31,12 +32,9 @@ const pool = new Pool({
 // ================== DATABASE MIGRATION ==================
 async function migrate() {
   try {
-    // First, drop any existing tables that might cause conflicts
     await pool.query("DROP TABLE IF EXISTS activities CASCADE;");
-    await pool.query("DROP TABLE IF EXISTS checkins CASCADE;"); // Drop checkins table if it exists
     await pool.query("DROP TABLE IF EXISTS users CASCADE;");
     
-    // Create users table with SERIAL id (integer)
     await pool.query(`
       CREATE TABLE users (
         id SERIAL PRIMARY KEY,
@@ -49,7 +47,6 @@ async function migrate() {
       );
     `);
     
-    // Create activities table with integer user_id to match users.id
     await pool.query(`
       CREATE TABLE activities (
         id SERIAL PRIMARY KEY,
@@ -69,7 +66,6 @@ async function migrate() {
 
 // ================== SEEDING ==================
 async function seedData() {
-  // Only seed in development or when explicitly enabled
   if (process.env.NODE_ENV === "production" && process.env.SEED_DATA !== "true") {
     console.log("🚫 Seeding skipped in production (set SEED_DATA=true to enable)");
     return;
@@ -78,21 +74,17 @@ async function seedData() {
   console.log("🌱 Starting database seeding...");
   
   try {
-    // Clear existing users
     await pool.query("TRUNCATE TABLE users RESTART IDENTITY CASCADE;");
     
-    // Hash passwords
     const adminPassword = await bcrypt.hash("scube@1234", 10);
     const employeePassword = await bcrypt.hash("scube@4321", 10);
     
     const users = [
-      // 👑 Admins
       { name: "Shanti Saran Singh", role: "admin", email: "singhss@scube.co.in", mobile: "9831038262", employee_id: "ADM-S.S Singh", password: adminPassword },
       { name: "Sandeep Sarkar", role: "admin", email: "sandeep@scube.co.in", mobile: "9831036858", employee_id: "ADM-Sandeep", password: adminPassword },
       { name: "Snehashis Saha", role: "admin", email: "marcom@scube.co.in", mobile: "9330199588", employee_id: "ADM-Snehashis", password: adminPassword },
       { name: "Komal Gupta", role: "admin", email: "komal@scube.co.in", mobile: "7003045682", employee_id: "ADM-Komal", password: adminPassword },
       { name: "MD Shoaib Raza", role: "admin", email: "shoaib@scube.co.in", mobile: "9831259095", employee_id: "ADM-Shoaib", password: adminPassword },
-      // 👷 Employees
       { name: "Snehasish Paul", role: "employee", email: "snehasish@scube.co.in", mobile: "8017892062", employee_id: "SCS-03318", password: employeePassword },
       { name: "Zuber Alam", role: "employee", email: "zuber@scube.co.in", mobile: "9891377424", employee_id: "SCS-01102", password: employeePassword },
       { name: "Bharath Kumar TM", role: "employee", email: "bharath@scube.co.in", mobile: "9844722312", employee_id: "SCS-08017", password: employeePassword },
@@ -152,20 +144,103 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// ================== START SERVER WITH CONDITIONAL SEEDING ==================
+// ================== GEOCODING ENDPOINT ==================
+app.get('/api/geocode', async (req, res) => {
+  const { lat, lon, address } = req.query;
+
+  try {
+    if (address) {
+      // Forward geocoding
+      const response = await axios.get("https://nominatim.openstreetmap.org/search", {
+        params: { q: address, format: "json", limit: 1 },
+        headers: { "User-Agent": "TrackerApp/1.0" }
+      });
+      if (response.data && response.data.length > 0) {
+        const loc = response.data[0];
+        return res.json({ lat: parseFloat(loc.lat), lng: parseFloat(loc.lon) });
+      } else {
+        return res.status(404).json({ error: "No results found" });
+      }
+    } else if (lat && lon) {
+      // Reverse geocoding
+      const response = await axios.get("https://nominatim.openstreetmap.org/reverse", {
+        params: { lat, lon, format: "json" },
+        headers: { "User-Agent": "TrackerApp/1.0" }
+      });
+      if (response.data && response.data.display_name) {
+        return res.json({ address: response.data.display_name });
+      } else {
+        return res.status(404).json({ error: "No address found" });
+      }
+    }
+    return res.status(400).json({ error: "Either address or lat/lon required" });
+  } catch (err) {
+    console.error("Geocoding error:", err.message);
+    res.status(500).json({ error: "Failed to geocode" });
+  }
+});
+
+// ================== ACTIVITY ENDPOINTS ==================
+
+// Create a new activity
+app.post("/api/activities", async (req, res) => {
+  const { user_id, activity, location } = req.body;
+  if (!user_id || !activity) {
+    return res.status(400).json({ error: "user_id and activity required" });
+  }
+  try {
+    const result = await pool.query(
+      "INSERT INTO activities (user_id, activity, location) VALUES ($1,$2,$3) RETURNING *",
+      [user_id, activity, location || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Activity insert error:", err);
+    res.status(500).json({ error: "Failed to create activity" });
+  }
+});
+
+// Get all activities for a user
+app.get("/api/activities/:user_id", async (req, res) => {
+  const { user_id } = req.params;
+  try {
+    const result = await pool.query(
+      "SELECT * FROM activities WHERE user_id=$1 ORDER BY created_at DESC",
+      [user_id]
+    );
+    res.json(result.rows); // Always an array
+  } catch (err) {
+    console.error("Activities fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch activities" });
+  }
+});
+
+// Checkout (mark checkout activity)
+app.post("/api/checkout", async (req, res) => {
+  const { user_id, location } = req.body;
+  if (!user_id) return res.status(400).json({ error: "user_id required" });
+  try {
+    const result = await pool.query(
+      "INSERT INTO activities (user_id, activity, location) VALUES ($1,$2,$3) RETURNING *",
+      [user_id, "checkout", location || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Checkout error:", err);
+    res.status(500).json({ error: "Failed to checkout" });
+  }
+});
+
+// ================== START SERVER ==================
 const PORT = process.env.PORT || 10000;
 
-// Function to start the server with proper initialization
 async function startServer() {
   try {
-    // Check database connection
     await pool.query("SELECT NOW()");
     console.log("📊 Database: Connected");
     
-    // Run migration
     await migrate();
     
-    // Conditional seeding based on environment variable
     if (process.env.SEED_DATA === "true") {
       console.log("🌱 Starting database seeding...");
       await seedData();
@@ -173,10 +248,9 @@ async function startServer() {
       console.log("🚫 Seeding skipped (set SEED_DATA=true to enable)");
     }
     
-    // Start the server
     server.listen(PORT, () => {
       console.log(`✅ Tracker backend running on port ${PORT}`);
-      console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
     });
   } catch (err) {
     console.error("❌ Failed to start server:", err);
@@ -184,5 +258,4 @@ async function startServer() {
   }
 }
 
-// Start the server
 startServer();
