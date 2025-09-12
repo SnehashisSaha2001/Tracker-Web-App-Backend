@@ -7,7 +7,6 @@ import dotenv from "dotenv";
 import bcrypt from "bcryptjs";
 import { Pool } from "pg";
 import axios from "axios";
-
 dotenv.config();
 const app = express();
 const server = http.createServer(app);
@@ -17,18 +16,15 @@ const io = new SocketIOServer(server, {
     methods: ["GET", "POST"]
   }
 });
-
 // Middleware
 app.use(cors());
 app.use(helmet());
 app.use(express.json());
-
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
-
 // ================== DATABASE MIGRATION ==================
 async function migrate() {
   try {
@@ -42,7 +38,7 @@ async function migrate() {
         role VARCHAR(20),
         email VARCHAR(100) UNIQUE,
         mobile VARCHAR(20),
-        employee_id VARCHAR(50),
+        employee_id VARCHAR(50) UNIQUE,
         password VARCHAR(200)
       );
     `);
@@ -63,7 +59,6 @@ async function migrate() {
     throw err;
   }
 }
-
 // ================== SEEDING ==================
 async function seedData() {
   if (process.env.NODE_ENV === "production" && process.env.SEED_DATA !== "true") {
@@ -118,16 +113,26 @@ async function seedData() {
     throw err;
   }
 }
-
 // ================== AUTH ENDPOINT ==================
 app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { employee_id, password } = req.body;
   try {
-    const result = await pool.query("SELECT * FROM users WHERE email=$1", [email]);
-    if (result.rows.length === 0) return res.status(400).json({ error: "User not found" });
+    if (!employee_id || !password) {
+      return res.status(400).json({ error: "Employee ID and password required" });
+    }
+    
+    // Find user by employee_id instead of email
+    const result = await pool.query("SELECT * FROM users WHERE employee_id=$1", [employee_id]);
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "User not found" });
+    }
+    
     const user = result.rows[0];
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ error: "Invalid password" });
+    if (!isMatch) {
+      return res.status(400).json({ error: "Invalid password" });
+    }
+    
     res.json({ 
       message: "Login successful", 
       user: { 
@@ -143,11 +148,9 @@ app.post("/api/auth/login", async (req, res) => {
     res.status(500).json({ error: "Login failed" });
   }
 });
-
 // ================== GEOCODING ENDPOINT ==================
 app.get('/api/geocode', async (req, res) => {
   const { lat, lon, address } = req.query;
-
   try {
     if (address) {
       // Forward geocoding
@@ -179,9 +182,7 @@ app.get('/api/geocode', async (req, res) => {
     res.status(500).json({ error: "Failed to geocode" });
   }
 });
-
 // ================== ACTIVITY ENDPOINTS ==================
-
 // Create a new activity
 app.post("/api/activities", async (req, res) => {
   const { user_id, activity, location } = req.body;
@@ -199,7 +200,6 @@ app.post("/api/activities", async (req, res) => {
     res.status(500).json({ error: "Failed to create activity" });
   }
 });
-
 // Get all activities for a user
 app.get("/api/activities/:user_id", async (req, res) => {
   const { user_id } = req.params;
@@ -214,7 +214,6 @@ app.get("/api/activities/:user_id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch activities" });
   }
 });
-
 // Checkout (mark checkout activity)
 app.post("/api/checkout", async (req, res) => {
   const { user_id, location } = req.body;
@@ -230,10 +229,8 @@ app.post("/api/checkout", async (req, res) => {
     res.status(500).json({ error: "Failed to checkout" });
   }
 });
-
 // ================== START SERVER ==================
 const PORT = process.env.PORT || 10000;
-
 async function startServer() {
   try {
     await pool.query("SELECT NOW()");
@@ -257,5 +254,4 @@ async function startServer() {
     process.exit(1);
   }
 }
-
 startServer();
