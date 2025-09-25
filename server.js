@@ -1,4 +1,4 @@
-// server.js (Final backend ready for Render)
+// server.js (Final backend ready for Render with root route)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -66,6 +66,20 @@ async function getAddress(lat, lon) {
 
 // Routes
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// Root welcome route
+app.get('/', (req, res) => {
+  res.json({
+    message: "✅ Tracker Backend is running!",
+    endpoints: {
+      health: "/api/health",
+      login: "/api/auth/login",
+      activities: "/api/activities",
+      followups: "/api/followups",
+      employees: "/api/employees"
+    }
+  });
+});
 
 // Auth
 app.post('/api/auth/login', async (req, res) => {
